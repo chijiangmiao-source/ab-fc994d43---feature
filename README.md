@@ -13,7 +13,8 @@
   "num_registers": 2,                      // 1..4 个整数寄存器
   "initial": [{"lo": 0, "hi": 0},          // 每寄存器初始范围;lo/hi 可为 null(无界)
                {"lo": -5, "hi": 5}],
-  "instructions": [ ... ]                  // 1..48 条,id 必须恰好为 0..N-1(稳定编号)
+  "instructions": [ ... ],                 // 1..48 条,id 必须恰好为 0..N-1(稳定编号)
+  "refinement": {"max_partitions": 2}      // 可选:有限精化预算 1..8,缺省/为 1 即旧版单状态分析
 }
 ```
 
@@ -45,6 +46,33 @@
 - **终态校验**:输出前逐条转移显式复核 `f(inv[p]) ⊑ inv[q]`;响应中逐程序点
   给出规范化闭包约束与入边来源(`points.<id>.invariant` / `.incoming`),
   调用方可独立重放同一检查。
+
+## 有限精化预算(可选)
+
+凸包汇合会把"安全分支"与"危险分支"过早合并,使可证明的(尤其非凸的,如
+`!=`)包线被误报。请求可携带 `refinement.max_partitions`(整数 2..8)启用
+**有界轨迹分区**:
+
+- 每个程序点至多保留 B 个**互不混淆**的八边形状态。分区随比较分支**稳定产生**:
+  分区标识为最近 B−1 个分支决断序列(如 `b2:t|b5:f`,`t/f` 为真假方向),
+  非比较边(goto/赋值/守卫外)原样携带标识;
+- 各分区**独立**经历回边 widening、下降复算与逐条转移校验(响应
+  `fixpoint.widened_partitions` 列出每个被 widening 的分区);
+- **预算耗尽时按固定规则合流**:新分区以凸包 join 并入该点标识字典序最小的
+  现存分区,只放宽上近似,**绝不丢弃任何可达执行**;合并原因与被吸收分区
+  记录在 `points.<id>.partitions[].merges`;
+- 每个断言只有在该点**全部保留分区**都蕴含包线时才放行;
+- 仍无法证明时,`first_unproven` 除原字段外给出未覆盖分区 `partition`、该点
+  各分区裁决 `partition_results`,并保持 `kind: "abstract_alarm"`;
+- 成功响应在原逐点证据外,每个分区列出**来源**(`origin`:来源点、来源分区、
+  分支决断、守卫收窄项)、逐分区**入边**(`incoming`)、强闭包后的
+  **闭包约束**(`closure_constraints`)与**合并原因**(`merges`),调用方可
+  独立重算每个分区的入边与转移;逐点 `invariant` 仍保留,为各分区的凸包。
+
+**未选择精化或预算为 1(含 `refinement: {}`)时**,走原有单状态引擎,审计
+接口字段、结论与错误合并语义与旧版逐字节一致(响应不含任何分区字段)。
+非法预算(非 1..8 整数)记结构错误 `invalid_refinement_budget`,合并反馈且
+不携带分析证据。
 
 ## 结论形态
 
@@ -85,24 +113,25 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
 
 `verify` 容器依次执行并以退出状态码报告结果(0 通过 / 1 失败):
 
-1. **代码测试**:`python -m unittest discover -s tests -t .`(35 个用例,
-   覆盖八边形域、分析器与 HTTP 接口);
+1. **代码测试**:`python -m unittest discover -s tests -t .`(47 个用例,
+   覆盖八边形域、分析器、精化预算分区与 HTTP 接口);
 2. **镜像构建检查**:`verify` 阶段 `FROM app` 阶段构建,构建 verify 即复核
    app 镜像可构建;冒烟时再将 `/health` 返回的版本与 `EXPECTED_VERSION` 比对,
    确认运行中的镜像即期望构建;
 3. **HTTP 冒烟**(`scripts/smoke.py`):等待健康路径就绪后,核对放行用例
    (含循环关系不变量)、未证告警用例(首个未证点、抽象边界、未涵盖条件)、
-   结构错误合并反馈用例(四类错误齐备且无旧证据),并复测无状态性。
+   结构错误合并反馈用例(四类错误齐备且无旧证据)、有限精化预算用例
+   (默认仍误报、预算 2 后两支分区各证、非法预算合并报错),并复测无状态性。
 
 ## 目录结构
 
 ```
 app/octagon.py    八边形域:DBM、强闭包、迁移函数、格运算、规范化约束输出
 app/program.py    指令解析、结构校验(合并反馈)、控制流图、widening 点
-app/analyzer.py   上升/下降不动点引擎、终态校验、断言蕴含判定
+app/analyzer.py   上升/下降不动点引擎(单状态与有界轨迹分区)、终态校验、断言蕴含判定
 app/server.py     HTTP 服务:GET /health,POST /audit
 tests/            单元测试(unittest,零依赖)
-scripts/smoke.py  verify 容器的 HTTP 冒烟
+scripts/smoke.py  verify 容器的 HTTP 冒烟(含精化预算用例)
 Dockerfile        多阶段:app(运行)/ verify(验证)
 docker-compose.yml app 服务(可配置宿主机端口)+ verify 容器
 ```

@@ -64,6 +64,21 @@ ERROR_CASE = {
     ],
 }
 
+# 有限精化预算:非凸包线 x0 != 5 在凸包 [0,10] 上必误报,预算 2 的两个
+# 分支分区各自可证;同脚本不带 refinement 时必须仍是 fail(接口兼容)。
+REFINE_CASE = {
+    "num_registers": 1,
+    "initial": [{"lo": 0, "hi": 10}],
+    "instructions": [
+        {"id": 0, "op": "branch",
+         "cond": {"coefs": {"0": 1}, "op": "<=", "value": 0}, "target": 2},
+        {"id": 1, "op": "set", "reg": 0, "value": 10},
+        {"id": 2, "op": "assert",
+         "cond": {"coefs": {"0": 1}, "op": "!=", "value": 5}},
+        {"id": 3, "op": "halt"},
+    ],
+}
+
 _failures = []
 
 
@@ -143,6 +158,27 @@ def main():
     code, body = request("POST", "/audit", PASS_CASE)
     check("no stale state after error case",
           code == 200 and body.get("verdict") == "pass")
+
+    # 有限精化预算:默认请求对非凸包线仍 fail;预算 2 后两支分区各证 → pass
+    code, body = request("POST", "/audit", REFINE_CASE)
+    check("refine off stays fail (legacy semantics)",
+          code == 200 and body.get("verdict") == "fail")
+    code, body = request("POST", "/audit",
+                         dict(REFINE_CASE, refinement={"max_partitions": 2}))
+    check("refine budget 2 proves both branch partitions",
+          code == 200 and body.get("verdict") == "pass",
+          f"code={code} body={body}")
+    check("refine evidence lists partitions with closure and origin",
+          code == 200 and
+          {p.get("id") for p in body.get("points", {}).get("2", {}).get("partitions", [])}
+          == {"b0:t", "b0:f"} and
+          all(p.get("closure_constraints") and p.get("origin")
+              for p in body["points"]["2"]["partitions"]))
+    code, body = request("POST", "/audit",
+                         dict(REFINE_CASE, refinement={"max_partitions": 9}))
+    check("refine invalid budget is merged structural error",
+          code == 200 and body.get("verdict") == "error" and
+          {"points", "assertions"}.isdisjoint(body))
 
     if _failures:
         print(f"smoke FAILED: {len(_failures)} check(s): {', '.join(_failures)}")
