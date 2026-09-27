@@ -51,6 +51,29 @@ FAIL_CASE = {
     ],
 }
 
+# 合流凸包引入伪状态:两支 x0=0 / x0=2 汇合为 [0,2](含伪点 1),经 x0>=1
+# 守卫后单分区只能给出 [1,2],无法证 x0==2;budget=2 跟踪分支后 x0=0 支在
+# 守卫处不可行,仅剩 x0=2 支,应放行。
+REFINEMENT_CASE = {
+    "num_registers": 2,
+    "initial": [{"lo": 0, "hi": 0}, {"lo": 0, "hi": 1}],
+    "instructions": [
+        {"id": 0, "op": "set", "reg": 0, "value": 0},
+        {"id": 1, "op": "branch",
+         "cond": {"coefs": {"1": 1}, "op": "<=", "value": 0}, "target": 5},
+        {"id": 2, "op": "add", "reg": 0, "value": 2},
+        {"id": 3, "op": "goto", "target": 6},
+        {"id": 4, "op": "add", "reg": 0, "value": 0},
+        {"id": 5, "op": "add", "reg": 0, "value": 0},
+        {"id": 6, "op": "branch",
+         "cond": {"coefs": {"0": 1}, "op": ">=", "value": 1}, "target": 8},
+        {"id": 7, "op": "halt"},
+        {"id": 8, "op": "assert",
+         "cond": {"coefs": {"0": 1}, "op": "==", "value": 2}},
+        {"id": 9, "op": "halt"},
+    ],
+}
+
 # 四类结构错误:寄存器越界 + 跳转悬空 + 不可解析约束 + 无可达终止,应合并反馈
 ERROR_CASE = {
     "num_registers": 2,
@@ -138,6 +161,59 @@ def main():
           f"kinds={kinds}")
     check("error case returns no stale evidence",
           "points" not in body and "assertions" not in body)
+
+    # 有限精化:同一脚本未选精化时为抽象告警,budget=2 分区后放行
+    code, plain = request("POST", "/audit", REFINEMENT_CASE)
+    check("refinement case is alarm without partition tracking",
+          code == 200 and plain.get("verdict") == "fail"
+          and plain.get("first_unproven", {}).get("point") == 8,
+          f"code={code} verdict={plain.get('verdict')}")
+    check("unrefined response stays compatible (no partition fields)",
+          "partitions" not in plain.get("points", {}).get("8", {})
+          and "partition_merges" not in plain)
+
+    refined = dict(REFINEMENT_CASE, refinement={"budget": 2})
+    code, body = request("POST", "/audit", refined)
+    check("refinement budget=2 verdict flips to pass",
+          code == 200 and body.get("verdict") == "pass",
+          f"code={code} body={body}")
+    check("refinement metadata echoed",
+          body.get("refinement", {}).get("budget") == 2
+          and body.get("refinement", {}).get("history_window") == 1)
+    p8 = body.get("points", {}).get("8", {})
+    parts = p8.get("partitions", [])
+    check("refinement lists surviving partition with closure",
+          len(parts) == 1 and any(
+              c.get("text") == "x0 <= 2" for c in parts[0].get("invariant", []))
+          and any(c.get("text") == "-x0 <= -2" for c in parts[0].get("invariant", [])),
+          f"partitions={parts}")
+    check("partition incoming is replayable (from, from_partition, edge)",
+          parts and parts[0].get("incoming") == [{
+              "from": 6, "edge": "branch_true",
+              "from_partition": [{"branch": 1, "direction": "false"}]}],
+          f"incoming={parts[0].get('incoming') if parts else None}")
+    check("partition merge reasons present",
+          isinstance(body.get("partition_merges"), list))
+    # 每分区转移均经校验
+    check("refinement post-fixpoint verified",
+          body.get("fixpoint", {}).get("post_fixpoint_verified") is True)
+
+    # budget=1 时响应形态与未选精化完全一致
+    code, b1 = request("POST", "/audit",
+                       dict(REFINEMENT_CASE, refinement={"budget": 1}))
+    check("budget=1 keeps legacy semantics (still alarm, no partition fields)",
+          code == 200 and b1.get("verdict") == "fail"
+          and "partitions" not in b1.get("points", {}).get("8", {})
+          and "partition_merges" not in b1)
+
+    # 非法精化预算:结构错误合并反馈
+    code, body = request("POST", "/audit",
+                         dict(REFINEMENT_CASE, refinement={"budget": 9}))
+    check("invalid refinement budget rejected with merged error",
+          code == 200 and body.get("verdict") == "error"
+          and "invalid_refinement" in {e.get("kind") for e in body.get("errors", [])}
+          and "points" not in body,
+          f"body={body}")
 
     # 无状态性:结构错误之后再次审计,结论不受既往请求影响
     code, body = request("POST", "/audit", PASS_CASE)

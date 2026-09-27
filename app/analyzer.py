@@ -4,7 +4,8 @@
   1. 结构校验(失败则合并反馈,不产生任何分析证据);
   2. 上升迭代:混沌工作集算法,回边目标处施加固定规则 widening,保证终止;
   3. 下降复算:自后不动点出发按 Gauss-Seidel 次序反复重算各点并取交,
-     逐步回收 widening 损失的精度,每一步都仍是后不动点;
+     逐步回收 widening 损失的精度;每轮整体提交前复核归纳性,若某轮半加强
+     状态破坏转移保持则回退到上一个归纳后不动点(宁失精度,不破可靠性);
   4. 终态校验:逐条转移显式复核 f(inv[p]) ⊑ inv[q],确保输出确实为
      归纳不变量,调用方可凭响应中的逐点约束与入边来源独立重放该检查;
   5. 断言判定:每个可达断言须被该点不变量蕴含,否则按程序点编号给出
@@ -15,26 +16,13 @@ from __future__ import annotations
 
 from collections import deque
 
-from .octagon import INF, Octagon, neg_terms, terms_text
+from .octagon import Octagon
+from .partitioning import analyze_partitioned, parse_refinement
 from .program import EXIT, parse_program
+from .transfers import apply_action as _apply_action
+from .transfers import check_assertion as _check_assertion
 
 MAX_DESCENDING_PASSES = 8
-
-
-def _apply_action(state: Octagon, action: tuple) -> "Octagon | None":
-    """对一条出边施加迁移函数;结果为空(不可行)时返回 None。"""
-    kind = action[0]
-    out = state.copy()
-    if kind == "set":
-        out.assign_const(action[1], action[2])
-    elif kind == "add":
-        out.shift_const(action[1], action[2])
-    elif kind == "guard":
-        for terms, k in action[1]:
-            out.meet(terms, k)
-            if out.empty:
-                return None
-    return None if out.empty else out
 
 
 class _Engine:
@@ -101,6 +89,8 @@ class _Engine:
     def _descending(self) -> None:
         inv = self.inv
         for _ in range(MAX_DESCENDING_PASSES):
+            # 快照上一个归纳后不动点:本轮加强若破坏归纳性须整体回退
+            snapshot = {p: v for p, v in inv.items()}
             changed = False
             for q in self.points:
                 cur = inv[q]
@@ -129,68 +119,42 @@ class _Engine:
             self.descending_passes += 1
             if not changed:
                 break
+            # Gauss-Seidel 在轮次上限处可能停在半加强状态(前驱已收紧、后继
+            # 尚未复算);只有候选确为归纳后不动点才提交,否则回退并终止。
+            if self._inductive_violations(inv):
+                for p in self.points:
+                    inv[p] = snapshot[p]
+                break
 
     # ------------------------------------------------------------------
     # 终态校验:逐条转移显式复核不变量保持性
     # ------------------------------------------------------------------
-    def _verify(self) -> list:
+    def _inductive_violations(self, states: dict) -> list:
+        """检查 states 是否为归纳后不动点:f(states[p]) ⊑ states[q] 处处成立。"""
         violations = []
-        head = self.inv[0]
+        head = states[0]
         if head is None or not self.initial.incl(head):
             violations.append({"from": "entry", "to": 0, "kind": "entry"})
         for p in self.points:
-            src = self.inv[p]
+            src = states[p]
             if src is None:
                 continue
             for e in self.out_edges[p]:
                 y = _apply_action(src, e.action)
                 if y is None:
                     continue
-                dst = self.inv[e.dst]
+                dst = states[e.dst]
                 if dst is None or not y.incl(dst):
                     violations.append({"from": p, "to": e.dst, "kind": e.kind})
         return violations
+
+    def _verify(self) -> list:
+        return self._inductive_violations(self.inv)
 
     def run(self) -> list:
         self._ascending()
         self._descending()
         return self._verify()
-
-
-# ----------------------------------------------------------------------
-# 断言蕴含判定
-# ----------------------------------------------------------------------
-def _bound_detail(state: Octagon, terms: tuple, k: int, disjunction: bool = False) -> dict:
-    b = state.bound(terms) if terms else 0
-    detail = {
-        "text": f"{terms_text(terms)} <= {k}",
-        "bound": None if b == INF else b,
-        "required": k,
-        "implied": b <= k,
-    }
-    if disjunction:
-        detail["disjunction"] = True
-    return detail
-
-
-def _check_assertion(state: Octagon, cond) -> tuple:
-    """返回 (是否被蕴含, 逐条件界信息)。!= 以两个析取支检查。"""
-    terms, kind, k = cond.terms, cond.kind, cond.k
-    if kind == "le":
-        details = [_bound_detail(state, terms, k)]
-        return details[0]["implied"], details
-    if kind == "eq":
-        details = [
-            _bound_detail(state, terms, k),
-            _bound_detail(state, neg_terms(terms), -k),
-        ]
-        return all(d["implied"] for d in details), details
-    # ne:expr <= k-1 或 -expr <= -k-1 任一成立即蕴含
-    details = [
-        _bound_detail(state, terms, k - 1, disjunction=True),
-        _bound_detail(state, neg_terms(terms), -k - 1, disjunction=True),
-    ]
-    return any(d["implied"] for d in details), details
 
 
 # ----------------------------------------------------------------------
@@ -215,11 +179,20 @@ def _points_view(engine: _Engine) -> dict:
 
 
 def analyze(payload) -> dict:
-    """审计入口:返回 pass / fail / error 三种结论之一。"""
+    """审计入口:返回 pass / fail / error 三种结论之一。
+
+    未选择 refinement 或 refinement.budget == 1 时走单分区引擎,结论与响应
+    形态严格兼容;budget >= 2 时启用有限精化的分支跟踪分区引擎。
+    """
     prog, errors = parse_program(payload)
+    budget, refinement_errors = parse_refinement(payload.get("refinement"))
+    errors = errors + refinement_errors
     if errors:
-        # 结构问题合并反馈;不附带任何(旧)分析证据
+        # 结构问题(含非法精化参数)合并反馈;不附带任何(旧)分析证据
         return {"verdict": "error", "reason": "structural_errors", "errors": errors}
+
+    if budget is not None and budget >= 2:
+        return analyze_partitioned(prog, budget)
 
     engine = _Engine(prog)
     violations = engine.run()
